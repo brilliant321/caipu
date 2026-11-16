@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-把「烹饪储备库」104 道菜打包成一个单文件手机网页（菜谱手册.html）。
+把「烹饪储备库」104 道菜打包成一个单文件手机网页（index.html）。
 用法：python build_web.py
-输出：烹饪储备库/菜谱手册.html
+输出：烹饪储备库/index.html
 """
 import os
 import re
@@ -12,7 +12,7 @@ import html as html_lib
 from markdown import markdown as md_convert
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.path.join(ROOT, "菜谱手册.html")
+OUT = os.path.join(ROOT, "index.html")
 
 CAT_ICONS = {
     "蔬菜": "🥬",
