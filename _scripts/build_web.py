@@ -3,6 +3,10 @@
 把「烹饪储备库」104 道菜打包成一个单文件手机网页（index.html）。
 用法：python build_web.py
 输出：烹饪储备库/index.html
+
+支持两种检索模式：
+1. 搜菜名 / 食材 / 分类（关键词）
+2. 报原料 → 推荐菜（现有能做 / 需补购，含忌口·口味过滤）
 """
 import os
 import re
@@ -63,6 +67,131 @@ def cat_name_of(dirname: str) -> str:
     return dirname.split("_", 1)[1]
 
 
+# ---------- 食材表解析（用于「报原料 → 推荐菜」） ----------
+
+# 这些词本身不是食材（是备注/程度/处理方式），从食材名里剔除
+NOISE_WORDS = {
+    "去骨", "去皮", "去籽", "去壳", "去虾线", "去内脏",
+    "切段", "切片", "切末", "切丝", "切丁", "剁碎", "剁末", "拍碎", "碾碎",
+    "洗净", "泡软", "煮熟", "蒸熟", "焯水", "汆烫", "过油", "沥干",
+    "适量", "少许", "各", "均可", "任选", "任选一种", "任选几种", "任选其一",
+    "可选", "可加可不加", "备选", "装饰", "点缀", "约", "一些", "一点",
+    "几个", "半个", "整", "大", "小", "等",
+    "配菜", "配料", "主料", "辅料", "点缀料", "其他", "其它",
+    "成品约", "分两次用", "分几次用",
+}
+
+_generic_num = re.compile(r"^[\d.~～\-–—]+$")
+
+
+def _clean_token(t: str) -> str:
+    t = strip_wiki(t).replace("**", "").strip()
+    t = re.sub(r"[「」『』\"'`]", "", t)
+    t = t.strip()
+    if not t or _generic_num.match(t):
+        return ""
+    # 去掉尾部噪音词（如「豇豆均可」「小葱点缀」）
+    for w in sorted(NOISE_WORDS, key=len, reverse=True):
+        if t == w:
+            return ""
+        if t.endswith(w):
+            t = t[: -len(w)].strip()
+    if not t or _generic_num.match(t):
+        return ""
+    return t
+
+
+def parse_cell(cell: str):
+    """把食材表第一列的一格，解析成「组」的列表。
+    一格 = 顿号/逗号分隔的多个「且」关系组；每组内 = 斜杠/「或」分隔的「或」关系别名。
+    例：'葱、姜' -> [['葱'], ['姜']]
+        '香醋（或白醋 / 苹果醋）' -> [['香醋', '白醋', '苹果醋']]
+    返回：[[别名...], [别名...], ...]（外层是且，内层是或）"""
+    groups = []
+    for part in re.split(r"[、，,]", cell):
+        part = part.strip()
+        if not part:
+            continue
+        alts = []
+        m = re.match(r"^(.*?)[（(]\s*(.*?)\s*[）)]$", part)
+        if m and m.group(1).strip():
+            main = _clean_token(m.group(1))
+            if main:
+                alts.append(main)
+            inner = m.group(2)
+            for sub in re.split(r"[/、，或]", inner):
+                s = _clean_token(sub)
+                if s:
+                    alts.append(s)
+        else:
+            for sub in re.split(r"[/或]", part):
+                s = _clean_token(sub)
+                if s:
+                    alts.append(s)
+        # 去重、保序
+        seen = []
+        for a in alts:
+            if a not in seen:
+                seen.append(a)
+        if seen:
+            groups.append(seen)
+    return groups
+
+
+def extract_first_ingredients(raw: str):
+    """只取第一张食材表（初学版 / 唯一档），返回 group 列表。"""
+    out = []
+    in_t = False
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s.startswith("|"):
+            if in_t:
+                break
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if len(cells) >= 3 and cells[0] == "食材":
+            in_t = True
+            continue
+        if not in_t:
+            continue
+        # 分隔行 |---|:---|---|
+        if all(re.fullmatch(r"[-:]+", c) for c in cells):
+            continue
+        if cells[0]:
+            out.extend(parse_cell(cells[0]))
+    return out
+
+
+# ---------- 口味标签（用于忌口/口味匹配，如「不吃甜食」） ----------
+
+# 甜味关键词（子串判断：糖/蜜/炼乳…）
+SWEET_KEYS = ("糖", "蜜", "炼乳", "焦糖", "糖浆", "枫糖", "麦芽糖")
+# 咸口关键词（子串判断，单向：关键词是食材名的子串）
+SAVORY_KEYS = ("盐", "生抽", "老抽", "酱油", "蚝油", "醋", "料酒", "黄酒", "花雕酒",
+               "辣椒", "豆瓣酱", "剁椒", "泡椒", "花椒", "胡椒", "味精", "鸡精", "咸")
+# 明确甜点（含盐的点心也在此列出，兜底）
+DESSERT_NAMES = {
+    "冰糖雪梨", "香橙蒸蛋", "芒果西米露", "自制草莓酱", "自制葡萄汁",
+    "脆皮炸香蕉", "双皮奶", "自制酸奶", "黄油曲奇", "肉桂卷",
+    "葡萄干司康", "拔丝红薯", "拔丝苹果", "姜汁撞奶", "冰糖银耳羹",
+    "杏仁豆腐", "琥珀核桃", "心太软", "黑芝麻糊",
+}
+
+
+def compute_tags(ings, name=""):
+    """按用料判断口味标签。目前只算「甜」：明确甜点，或含甜味料且不含咸口料。"""
+    flat = set()
+    for g in ings:
+        for a in g:
+            flat.add(a)
+    has_sweet = any(any(k in a for k in SWEET_KEYS) for a in flat)
+    has_savory = any(any(k in a for k in SAVORY_KEYS) for a in flat)
+    tags = []
+    if name in DESSERT_NAMES or (has_sweet and not has_savory):
+        tags.append("甜")
+    return tags
+
+
 def main():
     dishes = []
     for entry in sorted(os.listdir(ROOT)):
@@ -99,12 +228,15 @@ def main():
                     extensions=["tables", "sane_lists"],
                     output_format="html5",
                 )
+                ings = extract_first_ingredients(raw)
                 dishes.append({
                     "id": str(len(dishes)),
                     "name": fn[:-3],
                     "title": title,
                     "category": cat,
                     "ingredient": ing,
+                    "ings": ings,
+                    "tags": compute_tags(ings, fn[:-3]),
                     "html": body_html,
                 })
 
@@ -147,7 +279,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 :root{
   --bg:#faf6f0; --card:#ffffff; --ink:#2b2320; --sub:#8a7a6f;
   --line:#efe6db; --accent:#e05c2e; --accent-soft:#fbe7dd;
-  --gold:#c8922f;
+  --gold:#c8922f; --green:#3a7d44;
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;padding:0}
@@ -162,6 +294,10 @@ header{position:sticky;top:0;z-index:20;background:var(--bg);
 header .row{display:flex;align-items:center;gap:10px}
 header .brand{font-weight:700;font-size:19px;white-space:nowrap}
 header .brand small{display:block;font-weight:400;font-size:12px;color:var(--sub)}
+.modes{display:flex;gap:8px;margin-top:10px}
+.mode{flex:1;border:1px solid var(--line);background:var(--card);border-radius:10px;
+  padding:8px 0;font-size:14px;color:var(--sub);cursor:pointer;text-align:center;transition:.12s}
+.mode.on{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
 .search{margin-top:10px;position:relative}
 .search input{width:100%;border:1px solid var(--line);background:var(--card);
   border-radius:12px;padding:11px 14px 11px 38px;font-size:15px;color:var(--ink);
@@ -169,6 +305,11 @@ header .brand small{display:block;font-weight:400;font-size:12px;color:var(--sub
 .search input:focus{border-color:var(--accent)}
 .search .ic{position:absolute;left:13px;top:50%;transform:translateY(-50%);
   color:var(--sub);font-size:15px}
+.ing-extra{margin-top:8px}
+.ing-extra input{width:100%;border:1px solid var(--line);background:var(--card);
+  border-radius:12px;padding:10px 14px;font-size:14px;color:var(--ink);outline:none}
+.ing-extra input:focus{border-color:var(--accent)}
+.hint{font-size:12px;color:var(--sub);margin-top:6px;padding:0 2px;line-height:1.5}
 
 .wrap{max-width:720px;margin:0 auto;padding:14px 14px 40px}
 
@@ -192,6 +333,12 @@ header .brand small{display:block;font-weight:400;font-size:12px;color:var(--sub
 .dish .m{font-size:12px;color:var(--sub);margin-top:2px}
 .tag{display:inline-block;font-size:11px;color:var(--accent);background:var(--accent-soft);
   border-radius:6px;padding:1px 7px;margin-left:6px;vertical-align:1px}
+.tag.ok{color:var(--green);background:#e7f2e8}
+.dish .need{font-size:12px;color:var(--gold);margin-top:2px}
+
+/* 报原料结果 */
+.sum{background:var(--accent-soft);border:1px solid var(--line);border-radius:12px;
+  padding:10px 12px;font-size:13px;color:#7a4a30;margin-bottom:2px;line-height:1.6}
 
 /* 详情页 */
 .detail-head{background:var(--card);border:1px solid var(--line);border-radius:16px;
@@ -236,9 +383,17 @@ header .brand small{display:block;font-weight:400;font-size:12px;color:var(--sub
   <div class="row">
     <div class="brand">烹饪储备库<small id="subBrand">手机菜谱手册</small></div>
   </div>
+  <div class="modes" id="modes">
+    <button class="mode on" data-mode="search">🔍 搜菜名</button>
+    <button class="mode" data-mode="ing">🧺 报原料</button>
+  </div>
   <div class="search">
-    <span class="ic">🔍</span>
+    <span class="ic" id="searchIc">🔍</span>
     <input id="q" type="search" placeholder="搜菜名 / 食材 / 分类，如「鱼香」「猪肉」" autocomplete="off">
+  </div>
+  <div class="ing-extra" id="ingExtra" style="display:none">
+    <input id="taboo" type="text" placeholder="忌口 / 口味（可选）：不吃辣、不吃甜食、海鲜" autocomplete="off">
+    <div class="hint" id="ingHint">输入现有原料（含调料），顿号/逗号/空格分隔。忌口命中的菜不出现；偏好口味排前；原料匹配度越高越靠前。</div>
   </div>
 </header>
 
@@ -274,6 +429,13 @@ header .brand small{display:block;font-weight:400;font-size:12px;color:var(--sub
       <span class="crumb">🧭 新手必读</span></div>
     <div class="recipe" id="guideBody"></div>
   </div>
+
+  <!-- 报原料推荐 -->
+  <div id="view-ing" style="display:none">
+    <div class="topbar"><button class="back" onclick="goHome()">‹ 返回</button>
+      <span class="crumb">🧺 报原料推荐</span></div>
+    <div id="ingResult"></div>
+  </div>
 </div>
 
 <script>
@@ -283,7 +445,8 @@ const byId = {};
 dishes.forEach(d => byId[d.id] = d);
 
 const $ = id => document.getElementById(id);
-function show(id){['view-home','view-cat','view-dish','view-guide'].forEach(v=>$(v).style.display='none');$(id).style.display='block';window.scrollTo(0,0);}
+function show(id){['view-home','view-cat','view-dish','view-guide','view-ing'].forEach(v=>$(v).style.display='none');$(id).style.display='block';window.scrollTo(0,0);}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
 /* ---- 首页 ---- */
 function renderHome(){
@@ -307,14 +470,28 @@ function renderList(list){
       <div class="m">${esc(d.ingredient)} · 三档做法 · 点开看</div>
     </div>`).join('');
 }
-function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
 /* ---- 导航 ---- */
-function goHome(){location.hash='#/';}
+let mode = 'search';
+let dishFromIng = false;
+function goHome(){
+  dishFromIng = false;
+  $('q').value=''; $('taboo').value='';
+  setMode('search');
+  location.hash='#/';
+}
 function goCat(name){location.hash='#/c/'+encodeURIComponent(name);}
-function goDish(id){location.hash='#/d/'+id;}
+function goDish(id){
+  dishFromIng = (mode==='ing' && $('q').value.trim()!=='');
+  location.hash='#/d/'+id;
+}
 function goGuide(){location.hash='#/g';}
-function goBack(){ const d=$('dishBody').dataset; if(d && d.cat) location.hash='#/c/'+encodeURIComponent(d.cat); else location.hash='#/'; }
+function goBack(){
+  const d=$('dishBody').dataset;
+  if(d && d.from==='ing'){ dishFromIng=false; show('view-ing'); renderIng(); window.scrollTo(0,0); return; }
+  if(d && d.cat){ location.hash='#/c/'+encodeURIComponent(d.cat); }
+  else location.hash='#/';
+}
 
 function route(){
   const h=location.hash||'#/';
@@ -323,6 +500,7 @@ function route(){
     if(!d){goHome();return;}
     show('view-dish');
     $('dishBody').dataset.cat=d.category;
+    $('dishBody').dataset.from=(dishFromIng?'ing':'');
     $('dishCrumb').textContent=d.title;
     $('dishBody').innerHTML=
       `<div class="detail-head"><h1>${esc(d.title)}</h1>
@@ -349,25 +527,205 @@ function route(){
   } else {
     show('view-home'); renderHome();
   }
-  $('q').value='';
 }
 
-/* ---- 搜索 ---- */
+/* ---- 模式切换 ---- */
+function setMode(m){
+  mode = m;
+  document.querySelectorAll('.mode').forEach(b=>b.classList.toggle('on', b.dataset.mode===m));
+  $('ingExtra').style.display = (m==='ing') ? 'block' : 'none';
+  $('searchIc').textContent = (m==='ing') ? '🧺' : '🔍';
+  $('q').placeholder = (m==='ing') ? '输入现有原料：西红柿 鸡蛋 盐 油' : '搜菜名 / 食材 / 分类，如「鱼香」「猪肉」';
+  onQuery();
+}
+$('modes').addEventListener('click', e=>{
+  const b = e.target.closest('.mode'); if(!b) return;
+  setMode(b.dataset.mode);
+});
+
+/* ---- 匹配工具 ---- */
+function norm(s){return String(s).toLowerCase().replace(/[\s··：:；;、，,()（）\[\]{}<>.。／/]/g,'');}
+
+// 同义/大类映射：key 为归一化后的词，value 为「类」；同类才算等价
+const FAMILY = {
+  // 猪
+  '猪肉':'猪','五花肉':'猪','猪五花':'猪','猪肋排':'猪','猪排骨':'猪','排骨':'猪','肋排':'猪',
+  '里脊':'猪','猪里脊':'猪','猪瘦肉':'猪','瘦肉':'猪','猪肉末':'猪','肉末':'猪','猪蹄':'猪',
+  '后腿肉':'猪','前腿肉':'猪','梅花肉':'猪','猪颈肉':'猪','猪肚':'猪','猪肝':'猪',
+  '腊肉':'猪','腊肠':'猪','香肠':'猪','火腿':'猪','火腿肠':'猪','培根':'猪','午餐肉':'猪','猪油':'猪油',
+  // 牛
+  '牛肉':'牛','牛里脊':'牛','牛柳':'牛','牛腩':'牛','牛腱':'牛','牛腱子':'牛','牛尾':'牛',
+  '牛排':'牛','肥牛':'牛','牛肉末':'牛','牛肚':'牛',
+  // 羊
+  '羊肉':'羊','羊腿肉':'羊','羊肉卷':'羊','羊排':'羊','羊蝎子':'羊',
+  // 禽
+  '鸡肉':'鸡','鸡':'鸡','鸡腿':'鸡','鸡腿肉':'鸡','鸡胸':'鸡','鸡胸肉':'鸡','鸡翅':'鸡',
+  '鸡翅中':'鸡','鸡翅根':'鸡','鸡爪':'鸡','鸡胗':'鸡','鸡心':'鸡','三黄鸡':'鸡','清远鸡':'鸡',
+  '整鸡':'鸡','童子鸡':'鸡','鸡架':'鸡',
+  '鸭肉':'鸭','鸭':'鸭','鸭腿':'鸭','半只鸭':'鸭','鸭翅':'鸭',
+  // 蛋
+  '鸡蛋':'蛋','蛋':'蛋','鸭蛋':'蛋','鹌鹑蛋':'蛋','皮蛋':'蛋','咸蛋':'蛋','蛋黄':'蛋','蛋白':'蛋',
+  // 水产
+  '虾':'虾','活虾':'虾','基围虾':'虾','明虾':'虾','虾仁':'虾','大虾':'虾','河虾':'虾','对虾':'虾','小龙虾':'虾','虾皮':'虾',
+  '鱼':'鱼','鲈鱼':'鱼','草鱼':'鱼','鲤鱼':'鱼','鲫鱼':'鱼','带鱼':'鱼','黄花鱼':'鱼','黄鱼':'鱼',
+  '三文鱼':'鱼','巴沙鱼':'鱼','龙利鱼':'鱼','黑鱼':'鱼','鲢鱼':'鱼','胖头鱼':'鱼','鱼片':'鱼','鱼头':'鱼',
+  '鱿鱼':'海鲜','章鱼':'海鲜','墨鱼':'海鲜','螃蟹':'海鲜','蟹':'海鲜','蛤蜊':'海鲜','花甲':'海鲜',
+  '扇贝':'海鲜','生蚝':'海鲜','海带':'海鲜','紫菜':'海鲜',
+  // 蔬菜
+  '西红柿':'番茄','番茄':'番茄',
+  '土豆':'土豆','马铃薯':'土豆','洋芋':'土豆',
+  '青椒':'青椒','尖椒':'青椒','螺丝椒':'青椒','薄皮青椒':'青椒','柿子椒':'青椒','线椒':'青椒','杭椒':'青椒',
+  '彩椒':'彩椒','甜椒':'彩椒','红椒':'彩椒',
+  '蒜':'蒜','大蒜':'蒜','蒜头':'蒜','蒜瓣':'蒜','独头蒜':'蒜','蒜末':'蒜','蒜片':'蒜',
+  '蒜苗':'蒜苗','青蒜':'蒜苗',
+  '姜':'姜','生姜':'姜','老姜':'姜','嫩姜':'姜','姜片':'姜','姜末':'姜','姜丝':'姜',
+  '葱':'葱','小葱':'葱','大葱':'葱','香葱':'葱','青葱':'葱','葱白':'葱','葱花':'葱','葱段':'葱','洋葱':'洋葱',
+  '香菜':'香菜','黄瓜':'黄瓜',
+  '茄子':'茄子','长茄子':'茄子','圆茄子':'茄子','紫长茄':'茄子',
+  '豆角':'豆角','四季豆':'豆角','豇豆':'豆角','长豆角':'豆角',
+  '豆腐':'豆腐','嫩豆腐':'豆腐','内酯豆腐':'豆腐','老豆腐':'豆腐','北豆腐':'豆腐','南豆腐':'豆腐',
+  '豆腐皮':'豆皮','豆皮':'豆皮','千张':'豆皮','豆腐干':'豆干','豆干':'豆干','香干':'豆干',
+  '白菜':'白菜','大白菜':'白菜','娃娃菜':'白菜','圆白菜':'包菜','包菜':'包菜','卷心菜':'包菜','甘蓝':'包菜',
+  '青菜':'青菜','小青菜':'青菜','上海青':'青菜','油菜':'青菜','小白菜':'青菜',
+  '口蘑':'菌菇','香菇':'菌菇','金针菇':'菌菇','杏鲍菇':'菌菇','平菇':'菌菇','白玉菇':'菌菇','蟹味菇':'菌菇','蘑菇':'菌菇','木耳':'菌菇','银耳':'菌菇',
+  '胡萝卜':'胡萝卜','白萝卜':'白萝卜','萝卜':'萝卜','青萝卜':'萝卜',
+  '玉米':'玉米','玉米粒':'玉米','青豆':'青豆','豌豆':'豌豆','毛豆':'毛豆',
+  '山药':'山药','莲藕':'莲藕','藕':'莲藕','竹笋':'笋','笋':'笋','冬笋':'笋','春笋':'笋',
+  '西葫芦':'西葫芦','苦瓜':'苦瓜','丝瓜':'丝瓜','冬瓜':'冬瓜','南瓜':'南瓜','红薯':'红薯','地瓜':'红薯','芋头':'芋头',
+  '芹菜':'芹菜','西芹':'芹菜','韭菜':'韭菜','菠菜':'菠菜','生菜':'生菜','空心菜':'空心菜','茼蒿':'茼蒿','莴笋':'莴笋',
+  '西兰花':'西兰花','花菜':'花菜','菜花':'花菜',
+  // 调味料
+  '油':'油','食用油':'油','植物油':'油','花生油':'油','菜籽油':'油','玉米油':'油','色拉油':'油','调和油':'油','大豆油':'油','葵花籽油':'油',
+  '香油':'香油','芝麻油':'香油','麻油':'香油','黄油':'黄油',
+  '盐':'盐','食盐':'盐','海盐':'盐',
+  '糖':'糖','白糖':'糖','白砂糖':'糖','砂糖':'糖','冰糖':'糖','红糖':'糖','绵白糖':'糖',
+  '酱油':'酱油','生抽':'酱油','老抽':'酱油','蒸鱼豉油':'酱油','味极鲜':'酱油','鲜味汁':'酱油',
+  '醋':'醋','香醋':'醋','陈醋':'醋','米醋':'醋','白醋':'醋','苹果醋':'醋','9度米醋':'醋',
+  '料酒':'料酒','黄酒':'料酒','花雕酒':'料酒',
+  '淀粉':'淀粉','生粉':'淀粉','玉米淀粉':'淀粉','土豆淀粉':'淀粉','红薯淀粉':'淀粉','木薯淀粉':'淀粉','澄粉':'淀粉',
+  '蚝油':'蚝油','黑胡椒':'胡椒','白胡椒':'胡椒','黑胡椒粉':'胡椒','白胡椒粉':'胡椒','胡椒':'胡椒',
+  '花椒':'花椒','藤椒':'花椒','麻椒':'花椒',
+  '辣椒':'辣','干辣椒':'辣','小米辣':'辣','小米椒':'辣','辣椒油':'辣','辣椒粉':'辣','辣椒面':'辣',
+  '豆瓣酱':'辣','红油豆瓣':'辣','剁椒':'辣','泡椒':'辣','油泼辣子':'辣','红油':'辣',
+  '味精':'味精','鸡精':'味精','五香粉':'五香粉','孜然':'孜然','孜然粉':'孜然',
+  '甜':'甜','甜食':'甜','甜品':'甜','甜点':'甜','糖水':'甜',
+  '八角':'香料','桂皮':'香料','香叶':'香料','丁香':'香料','草果':'香料','小茴香':'香料',
+  '白芷':'香料','陈皮':'香料','豆蔻':'香料','砂仁':'香料','甘草':'香料','山奈':'香料','花椒粉':'花椒'
+};
+// 反向索引：类名 -> 该类的所有成员词
+const MEMBERS = {};
+Object.keys(FAMILY).forEach(k => { (MEMBERS[FAMILY[k]] = MEMBERS[FAMILY[k]] || []).push(k); });
+const FAMILY_IDS = new Set(Object.values(FAMILY));
+function hasFam(s){ const n=norm(s); return Object.prototype.hasOwnProperty.call(FAMILY,n) || FAMILY_IDS.has(n); }
+function familyOf(s){
+  const n = norm(s);
+  return Object.prototype.hasOwnProperty.call(FAMILY, n) ? FAMILY[n] : n;
+}
+function matchIng(alt, tok){
+  const a=norm(alt), t=norm(tok);
+  if(!a||!t) return false;
+  const fa=familyOf(alt), ft=familyOf(tok);
+  const aKnown=hasFam(alt), tKnown=hasFam(tok);
+  if(aKnown && tKnown) return fa===ft;
+  if(a===t || a.includes(t) || t.includes(a)) return true;
+  // 一侧已知、一侧未知：未知侧只要「包含」已知侧某个同类成员，即算等价
+  if(aKnown){ const mem=MEMBERS[fa]||[a]; if(mem.some(m=>t.includes(m)||m.includes(t))) return true; }
+  if(tKnown){ const mem=MEMBERS[ft]||[t]; if(mem.some(m=>a.includes(m)||m.includes(a))) return true; }
+  return false;
+}
+function parseTokens(s){return String(s).split(/[、，,;；\s]+/).map(x=>x.trim()).filter(Boolean);}
+
+function dishMatchWord(d, w){
+  const cands = [d.title, d.name, d.category, d.ingredient].concat((d.ings||[]).flat(), (d.tags||[]));
+  return cands.some(c=>matchIng(c, w));
+}
+function parseTaboo(s){
+  const excl=[], incl=[];
+  const NEG=/^(不吃|不要吃|不想要|不要|忌|讨厌|别|免|无|不喜|怕|不)/;
+  parseTokens(s).forEach(raw=>{
+    const neg = NEG.test(raw);
+    const word = raw.replace(NEG,'').trim();
+    if(word){ (neg?excl:incl).push(word); }
+  });
+  return {excl, incl};
+}
+
+/* ---- 报原料 → 推荐菜 ---- */
+// 水默认随时有，不算「需补购」（其余调料按用户要求：全都要报）
+const ALWAYS = new Set(['水','开水','清水','凉开水','温水','热水','冷水','纯净水','凉白开']);
+function dishCard(d){
+  const ok = d._can ? '<span class="tag ok">✅ 能做</span>' : '';
+  const miss = d._can ? '' : `<div class="need">🛒 缺：${d._missingNames.join('、')}</div>`;
+  return `<div class="dish" onclick="goDish('${d.id}')">
+    <div class="t">${esc(d.title)}<span class="tag">${esc(d.category)}</span>${ok}</div>
+    <div class="m">${esc(d.ingredient)} · 匹配 ${d._matched}/${d._total} 样</div>${miss}
+  </div>`;
+}
+function renderIng(){
+  const toks = parseTokens($('q').value);
+  if(!toks.length){ show('view-home'); renderHome(); return; }
+  show('view-ing');
+  const {excl, incl} = parseTaboo($('taboo').value);
+
+  // 1) 忌口：命中即彻底排除（含需补购）
+  let pool = dishes.filter(d => !excl.some(w=>dishMatchWord(d,w)));
+
+  // 2) 算匹配度 + 口味偏好命中数
+  pool.forEach(d=>{
+    const groups = (d.ings && d.ings.length) ? d.ings : [[d.ingredient]];
+    let matched=0; const missNames=[];
+    groups.forEach(g=>{
+      if(g.some(a=>ALWAYS.has(norm(a)))){ matched++; return; }
+      if(g.some(a=>toks.some(t=>matchIng(a,t)))){ matched++; }
+      else missNames.push(g[0]);
+    });
+    d._matched=matched; d._total=groups.length;
+    d._can = (missNames.length===0);
+    d._missingNames = missNames;
+    d._taste = incl.filter(w=>dishMatchWord(d,w)).length;
+  });
+
+  // 3) 排序：口味偏好命中数 ↓ → 原料匹配度 ↓ → 缺的少 ↓
+  pool.sort((a,b)=>
+    (b._taste - a._taste) ||
+    ((b._matched/b._total) - (a._matched/a._total)) ||
+    (a._missingNames.length - b._missingNames.length) ||
+    (a.title<b.title?-1:1)
+  );
+
+  const canCount = pool.filter(d=>d._can).length;
+  const tag=[];
+  if(excl.length) tag.push('忌口：'+excl.join('、'));
+  if(incl.length) tag.push('偏好：'+incl.join('、'));
+  let html = `<div class="sum">你报了 <b>${toks.length}</b> 样原料${tag.length?'，'+tag.join(' · '):''}。<br>命中 <b>${pool.length}</b> 道，按「口味偏好 → 原料匹配度」排序：✅能做 <b>${canCount}</b> 道 · 🛒需补购 <b>${pool.length-canCount}</b> 道。</div>`;
+
+  html += pool.length ? pool.map(dishCard).join('')
+    : `<div class="empty">没找到符合的菜（可能忌口把菜都排掉了），换个原料或忌口试试。</div>`;
+  $('ingResult').innerHTML = html;
+}
+
+/* ---- 搜索（搜菜名模式） ---- */
 let timer=null;
+function onQuery(){
+  const kw=$('q').value.trim();
+  if(mode==='ing'){ renderIng(); return; }
+  if(!kw){ show('view-home'); renderHome(); return; }
+  show('view-home');
+  const k=kw.toLowerCase();
+  const hit=dishes.filter(d=>
+    d.name.toLowerCase().includes(k)||d.title.toLowerCase().includes(k)||
+    d.ingredient.toLowerCase().includes(k)||d.category.toLowerCase().includes(k));
+  $('catGrid').innerHTML='';
+  $('totalCnt').textContent='';
+  renderList(hit);
+}
 $('q').addEventListener('input',()=>{
   clearTimeout(timer);
-  timer=setTimeout(()=>{
-    const kw=$('q').value.trim();
-    if(!kw){ show('view-home'); renderHome(); return; }
-    show('view-home');
-    const k=kw.toLowerCase();
-    const hit=dishes.filter(d=>
-      d.name.toLowerCase().includes(k)||d.title.toLowerCase().includes(k)||
-      d.ingredient.toLowerCase().includes(k)||d.category.toLowerCase().includes(k));
-    $('catGrid').innerHTML='';
-    $('totalCnt').textContent='';
-    renderList(hit);
-  },120);
+  timer=setTimeout(onQuery,120);
+});
+$('taboo').addEventListener('input',()=>{
+  clearTimeout(timer);
+  timer=setTimeout(onQuery,120);
 });
 
 $('openGuide').onclick=goGuide;
