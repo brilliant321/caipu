@@ -9,6 +9,15 @@ AI 烹饪助手知识库。用户是烹饪初学者，给菜谱要说人话、�
 - `20_复盘日志`：实操反馈与锁定记录。
 - `_scripts`：内部脚本，忽略。
 
+## 网页发布（GitHub Pages）
+
+- 网站地址固定：`https://brilliant321.github.io/caipu/`，入口 `index.html`。
+- `index.html` 是**生成物**，由 `_scripts/build_web.py` 从各菜谱 md 打包生成。**手改 md 后必须重新生成**，否则网页不更新。
+- 一键发布：`bash _scripts/publish.sh "本次改动说明"` —— 自动「重新生成 index.html → 提交 → 推送」。不带参数用默认信息「更新菜谱 YYYY-MM-DD」。
+- 手动三步：`python _scripts/build_web.py` → `git add -A && git commit -m "..."` → `git push origin main`。
+- push 后 GitHub Pages 约 1 分钟自动部署，链接不变，别人刷新即可见新内容。
+- **同步门控**：每次改动后先向用户说明并确认，用户确认后才执行 `git commit` + `git push`（库内所有文件，含 `publish.sh`、`CLAUDE.md`）。
+
 ## 菜品文件规范（写新菜、改菜谱都照这个）
 
 每道菜一个 markdown，固定区块：标题 → 归属食材行 → 一句简介 → 计量参考 → 「初学 / 进阶 / 大厨」三档做法 → 「🔒 已锁定最佳方案」。
