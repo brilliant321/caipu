@@ -138,9 +138,20 @@ def parse_cell(cell: str):
     return groups
 
 
+# 「可省略 / 可加可不加」的强标记：食材表里标了这些的料，不算「缺」、也可按忌口剔除
+OPTIONAL_MARKERS = ("可选", "可不加", "可省略", "可以不加", "任选", "酌情", "随意")
+
+
+def _row_optional(cells):
+    """食材表一行（含用量/说明列）是否标了「可省略」。"""
+    text = " ".join(cells[1:])
+    return any(m in text for m in OPTIONAL_MARKERS)
+
+
 def extract_first_ingredients(raw: str):
-    """只取第一张食材表（初学版 / 唯一档），返回 group 列表。"""
-    out = []
+    """只取第一张食材表（初学版 / 唯一档）。
+    返回 (groups, opt)：groups 每个是别名列表（外层且、内层或），opt 标记对应组是否可省略。"""
+    out, opt = [], []
     in_t = False
     for line in raw.splitlines():
         s = line.strip()
@@ -158,8 +169,11 @@ def extract_first_ingredients(raw: str):
         if all(re.fullmatch(r"[-:]+", c) for c in cells):
             continue
         if cells[0]:
-            out.extend(parse_cell(cells[0]))
-    return out
+            is_opt = _row_optional(cells)
+            for g in parse_cell(cells[0]):
+                out.append(g)
+                opt.append(is_opt)
+    return out, opt
 
 
 # ---------- 口味标签（用于忌口/口味匹配，如「不吃甜食」） ----------
@@ -228,7 +242,7 @@ def main():
                     extensions=["tables", "sane_lists"],
                     output_format="html5",
                 )
-                ings = extract_first_ingredients(raw)
+                ings, opt = extract_first_ingredients(raw)
                 dishes.append({
                     "id": str(len(dishes)),
                     "name": fn[:-3],
@@ -236,6 +250,7 @@ def main():
                     "category": cat,
                     "ingredient": ing,
                     "ings": ings,
+                    "opt": opt,
                     "tags": compute_tags(ings, fn[:-3]),
                     "html": body_html,
                 })
@@ -335,6 +350,8 @@ header .brand small{display:block;font-weight:400;font-size:12px;color:var(--sub
   border-radius:6px;padding:1px 7px;margin-left:6px;vertical-align:1px}
 .tag.ok{color:var(--green);background:#e7f2e8}
 .dish .need{font-size:12px;color:var(--gold);margin-top:2px}
+.dish .cut{font-size:12px;color:#1f8a70;margin-top:2px}
+.dish .skip{font-size:12px;color:var(--sub);margin-top:1px}
 
 /* 报原料结果 */
 .sum{background:var(--accent-soft);border:1px solid var(--line);border-radius:12px;
@@ -393,7 +410,7 @@ header .brand small{display:block;font-weight:400;font-size:12px;color:var(--sub
   </div>
   <div class="ing-extra" id="ingExtra" style="display:none">
     <input id="taboo" type="text" placeholder="忌口 / 口味（可选）：不吃辣、不吃甜食、海鲜" autocomplete="off">
-    <div class="hint" id="ingHint">输入现有原料（含调料），顿号/逗号/空格分隔。忌口命中的菜不出现；偏好口味排前；原料匹配度越高越靠前。</div>
+    <div class="hint" id="ingHint">输入现有原料（含调料），顿号/逗号/空格分隔。忌口「甜/糖/辣」会自动剔除可选料（如糖、辣椒），保住菜品主体；其它忌口命中即排除；偏好口味排前。</div>
   </div>
 </header>
 
@@ -599,6 +616,7 @@ const FAMILY = {
   '香油':'香油','芝麻油':'香油','麻油':'香油','黄油':'黄油',
   '盐':'盐','食盐':'盐','海盐':'盐',
   '糖':'糖','白糖':'糖','白砂糖':'糖','砂糖':'糖','冰糖':'糖','红糖':'糖','绵白糖':'糖',
+  '蜂蜜':'糖','炼乳':'糖','焦糖':'糖','糖浆':'糖','枫糖':'糖','麦芽糖':'糖',
   '酱油':'酱油','生抽':'酱油','老抽':'酱油','蒸鱼豉油':'酱油','味极鲜':'酱油','鲜味汁':'酱油',
   '醋':'醋','香醋':'醋','陈醋':'醋','米醋':'醋','白醋':'醋','苹果醋':'醋','9度米醋':'醋',
   '料酒':'料酒','黄酒':'料酒','花雕酒':'料酒',
@@ -641,7 +659,7 @@ function dishMatchWord(d, w){
 }
 function parseTaboo(s){
   const excl=[], incl=[];
-  const NEG=/^(不吃|不要吃|不想要|不要|忌|讨厌|别|免|无|不喜|怕|不)/;
+  const NEG=/^(不吃|不要吃|不想要|不要|忌口|忌|讨厌|别|免|无|不喜|怕|不)/;
   parseTokens(s).forEach(raw=>{
     const neg = NEG.test(raw);
     const word = raw.replace(NEG,'').trim();
@@ -650,15 +668,55 @@ function parseTaboo(s){
   return {excl, incl};
 }
 
+/* ---- 软忌口（甜 / 糖 / 辣）：可剔除「可选料」、只对「必需料/菜名/标签」整体排除 ---- */
+const SOFT_TABOOS = new Set(['甜','甜食','甜品','甜点','糖水','糖','白糖','白砂糖','砂糖','冰糖','红糖','绵白糖','蜂蜜','炼乳','焦糖','糖浆','枫糖','麦芽糖','辣','辣椒','香辣','麻辣']);
+// 甜类忌口：只排除「甜点/甜口菜」，并剔除「可选糖」；不因「必需糖」排除咸口菜（糖醋排骨/红烧肉/西红柿炒蛋不算「甜食」）
+const SWEET_TABOOS = new Set(['甜','甜食','甜品','甜点','糖水']);
+// 甜类忌口要能关联到「糖」类原料（FAMILY 里甜/糖是两族，这里补一条桥；辣类已由 FAMILY 覆盖）
+const SOFT_TABOO_FAMS = {'甜':['糖'],'甜食':['糖'],'甜品':['糖'],'甜点':['糖'],'糖水':['糖']};
+function tabooConflictFams(w){
+  const n = norm(w);
+  if(Object.prototype.hasOwnProperty.call(SOFT_TABOO_FAMS, n)) return SOFT_TABOO_FAMS[n];
+  if(FAMILY_IDS.has(n)) return [familyOf(w)];
+  return [];
+}
+// 返回 { action: 'keep' | 'exclude' | 'adapt', removedIdx: [可选料所在组下标] }
+function tabooVerdict(d, w){
+  const n = norm(w);
+  // 硬忌口（海鲜/牛/羊/花生…）：命中即排除（沿用旧逻辑）
+  if(!SOFT_TABOOS.has(n)){
+    return dishMatchWord(d, w) ? {action:'exclude'} : {action:'keep'};
+  }
+  // 软忌口
+  const idCands = [d.title, d.name, d.ingredient, d.category].concat(d.tags||[]);
+  if(idCands.some(c=>matchIng(c, w))) return {action:'exclude'};
+  const fams = tabooConflictFams(w);
+  const groups = (d.ings && d.ings.length) ? d.ings : [[d.ingredient]];
+  const removedIdx = [];
+  let hitCore = false;
+  groups.forEach((g,i)=>{
+    const hit = g.find(a => matchIng(a, w) || fams.some(f => matchIng(a, f)));
+    if(!hit) return;
+    const opt = d.opt && d.opt[i];
+    if(opt) removedIdx.push(i);
+    else if(!SWEET_TABOOS.has(n)) hitCore = true; // 甜类忌口：必需糖不算命中（提鲜/糖醋不算「甜食」）
+  });
+  if(hitCore) return {action:'exclude'};
+  if(removedIdx.length) return {action:'adapt', removedIdx};
+  return {action:'keep'};
+}
+
 /* ---- 报原料 → 推荐菜 ---- */
 // 水默认随时有，不算「需补购」（其余调料按用户要求：全都要报）
 const ALWAYS = new Set(['水','开水','清水','凉开水','温水','热水','冷水','纯净水','凉白开']);
 function dishCard(d){
   const ok = d._can ? '<span class="tag ok">✅ 能做</span>' : '';
   const miss = d._can ? '' : `<div class="need">🛒 缺：${d._missingNames.join('、')}</div>`;
+  const cut = (d._cutNames && d._cutNames.length) ? `<div class="cut">✂️ 已按忌口去掉：${d._cutNames.join('、')}</div>` : '';
+  const skip = (d._skipNames && d._skipNames.length) ? `<div class="skip">◽ 可不加：${d._skipNames.join('、')}</div>` : '';
   return `<div class="dish" onclick="goDish('${d.id}')">
     <div class="t">${esc(d.title)}<span class="tag">${esc(d.category)}</span>${ok}</div>
-    <div class="m">${esc(d.ingredient)} · 匹配 ${d._matched}/${d._total} 样</div>${miss}
+    <div class="m">${esc(d.ingredient)} · 匹配 ${d._matched}/${d._total} 样（必需料）</div>${miss}${cut}${skip}
   </div>`;
 }
 function renderIng(){
@@ -667,37 +725,59 @@ function renderIng(){
   show('view-ing');
   const {excl, incl} = parseTaboo($('taboo').value);
 
-  // 1) 忌口：命中即彻底排除（含需补购）
-  let pool = dishes.filter(d => !excl.some(w=>dishMatchWord(d,w)));
+  // 1) 忌口：硬忌口命中即排除；软忌口（甜/糖/辣）命中「可选料」→ 剔除、命中「必需料/菜名/标签」→ 排除
+  const pool = [];
+  dishes.forEach(d=>{
+    const removedIdx = new Set();
+    let drop = false;
+    for(const w of excl){
+      const v = tabooVerdict(d, w);
+      if(v.action==='exclude'){ drop = true; break; }
+      if(v.action==='adapt'){ v.removedIdx.forEach(i=>removedIdx.add(i)); }
+    }
+    if(drop) return;
+    d._removedIdx = removedIdx;
+    pool.push(d);
+  });
 
-  // 2) 算匹配度 + 口味偏好命中数
+  // 2) 算匹配度 + 口味偏好命中数（可选料不算缺、不计入「匹配分母」）
   pool.forEach(d=>{
     const groups = (d.ings && d.ings.length) ? d.ings : [[d.ingredient]];
-    let matched=0; const missNames=[];
-    groups.forEach(g=>{
-      if(g.some(a=>ALWAYS.has(norm(a)))){ matched++; return; }
+    const opt = d.opt || [];
+    let matched=0, total=0; const missNames=[], cutNames=[], skipNames=[];
+    groups.forEach((g,i)=>{
+      if(g.some(a=>ALWAYS.has(norm(a)))){ total++; matched++; return; } // 水默认有
+      if(opt[i]){ // 可选料：不做「缺」，按是否被忌口命中分「去掉/可不加」
+        if(d._removedIdx && d._removedIdx.has(i)) cutNames.push(g[0]);
+        else skipNames.push(g[0]);
+        return;
+      }
+      total++;
       if(g.some(a=>toks.some(t=>matchIng(a,t)))){ matched++; }
       else missNames.push(g[0]);
     });
-    d._matched=matched; d._total=groups.length;
+    d._matched=matched; d._total=total;
     d._can = (missNames.length===0);
     d._missingNames = missNames;
+    d._cutNames = cutNames;
+    d._skipNames = skipNames;
     d._taste = incl.filter(w=>dishMatchWord(d,w)).length;
   });
 
   // 3) 排序：口味偏好命中数 ↓ → 原料匹配度 ↓ → 缺的少 ↓
   pool.sort((a,b)=>
     (b._taste - a._taste) ||
-    ((b._matched/b._total) - (a._matched/a._total)) ||
+    ((b._total ? b._matched/b._total : 1) - (a._total ? a._matched/a._total : 1)) ||
     (a._missingNames.length - b._missingNames.length) ||
     (a.title<b.title?-1:1)
   );
 
   const canCount = pool.filter(d=>d._can).length;
+  const cutCount = pool.filter(d=>d._cutNames && d._cutNames.length).length;
   const tag=[];
   if(excl.length) tag.push('忌口：'+excl.join('、'));
   if(incl.length) tag.push('偏好：'+incl.join('、'));
-  let html = `<div class="sum">你报了 <b>${toks.length}</b> 样原料${tag.length?'，'+tag.join(' · '):''}。<br>命中 <b>${pool.length}</b> 道，按「口味偏好 → 原料匹配度」排序：✅能做 <b>${canCount}</b> 道 · 🛒需补购 <b>${pool.length-canCount}</b> 道。</div>`;
+  let html = `<div class="sum">你报了 <b>${toks.length}</b> 样原料${tag.length?'，'+tag.join(' · '):''}。<br>命中 <b>${pool.length}</b> 道，按「口味偏好 → 原料匹配度」排序：✅能做 <b>${canCount}</b> 道 · 🛒需补购 <b>${pool.length-canCount}</b> 道${cutCount?' · ✂️已按忌口自动去料 <b>'+cutCount+'</b> 道':''}。</div>`;
 
   html += pool.length ? pool.map(dishCard).join('')
     : `<div class="empty">没找到符合的菜（可能忌口把菜都排掉了），换个原料或忌口试试。</div>`;
